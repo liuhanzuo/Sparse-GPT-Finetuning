@@ -23,7 +23,7 @@ def get_module_name(param_name):
     
 # load model without masks
 def load_unmasked_model(existing_model, state_dict_path):
-    existing_model.load_state_dict(torch.load(state_dict_path))
+    existing_model.load_state_dict(torch.load(state_dict_path, weights_only=False))
 
 # prune 0s to a mask, to make training easier (ostensibly)
 class ZeroPruning(prune.BasePruningMethod):
@@ -76,9 +76,18 @@ def load_masked_model(existing_model, state_dict_path):
 def load_masked_model_single(existing_model, state_dict_path):
     #print('in')
     #print(torch.cuda.is_initialized())
-    state_dict = torch.load(state_dict_path, map_location=torch.device('cpu'))
+    loaded_object = torch.load(state_dict_path, map_location=torch.device('cpu'), weights_only=False)
+    
+    # Check if loaded object is a full model or a state_dict
+    if isinstance(loaded_object, torch.nn.Module):
+        # If it's a complete model object, extract its state_dict
+        state_dict = loaded_object.state_dict()
+    else:
+        # It's already a state_dict
+        state_dict = loaded_object
+    
     #print(torch.cuda.is_initialized())
-    if "module" in list(state_dict.keys())[0]:
+    if state_dict and "module" in list(state_dict.keys())[0]:
         state_dict = {k.replace('module.',''): v for k, v in state_dict.items()}
     #print(torch.cuda.is_initialized())
     existing_model.load_state_dict(state_dict)
@@ -86,6 +95,7 @@ def load_masked_model_single(existing_model, state_dict_path):
     # then reapply the (previously removed) masks
     mask_from_pruned(model=existing_model)
     #print('out')
+    return existing_model
     
 # unmask model with 0s in place
 def unmask_model(model, module_blacklist=default_opt_blacklist):

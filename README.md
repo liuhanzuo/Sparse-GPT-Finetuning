@@ -65,3 +65,55 @@ every other technique beyond 0.4 sparseness on OPT-125M and 0.6 sparseness on OP
 find that SparseGPT non-iterative pruning and fine-tuning is moderately successful compared to
 no fine-tuning in all cases, but is beaten out significantly by both iterative pruning and fine-tuning
 methods beyond 0.5 sparseness.
+
+## Quickstart (Windows PowerShell)
+
+The scripts and notebooks rely on PyTorch, Transformers, Datasets, and Accelerate. A minimal
+way to smoke-test the training loop without modifying notebooks is to run a tiny FSDP
+finetuning step on OPT-125M. The commands below assume a working CUDA setup. If you don't
+have a GPU, you can still run but it will be slow and memory-limited.
+
+1) Create and activate a virtual environment
+
+```
+python -m venv .venv; .\.venv\Scripts\Activate.ps1
+```
+
+2) Install dependencies
+
+```
+pip install -r requirements.txt
+pip install accelerate
+```
+
+If you need a specific CUDA-enabled torch, refer to https://pytorch.org/get-started/locally/
+and install the matching wheel, for example:
+
+```
+# Optional: replace with versions matching your CUDA
+pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+```
+
+3) Run a tiny finetune smoke test (downloads facebook/opt-125m on first run)
+
+```
+python .\run_fsdp_finetune.py
+```
+
+This uses Wikitext-2 streaming with very small steps. It will finish quickly and not save a
+checkpoint by default. To perform real finetuning:
+
+- Edit `run_fsdp_finetune.py` and raise `num_epochs`, `batch_size`, `train_steps`, and `max_step`.
+- Set `sparsity` to the value of an existing pruned checkpoint you created (e.g., `0.5`) and place
+  it under `pruned_models/{model_name}-{sparsity}.pt`.
+- For multi-GPU or advanced configs, consider using Hugging Face Accelerate config via
+  `accelerate config` then adapting `fsdp_finetune.py` accordingly.
+
+4) Notebooks
+
+- `SparseGPT.ipynb`: prune models (one-shot SparseGPT)
+- `Finetuning.ipynb`: finetune pruned models
+- `Iterative_Pruning.ipynb`: iterative prune + finetune with FSDP
+
+Tip: Large models (e.g., OPT-1.3B) require significant GPU memory. Start with OPT-125M, verify
+the pipeline, then scale up.

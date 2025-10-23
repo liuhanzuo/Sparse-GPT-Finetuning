@@ -161,7 +161,7 @@ def training_function(config, args):
                                                       output_attentions=True,
                                                       output_hidden_states=True)
     try:
-        load_masked_model_single(model, f'pruned_models/{config["model_name"]}-{config["sparsity"]}.pt')
+        model = load_masked_model_single(model, f'pruned_models/{config["model_name"]}-{config["sparsity"]}.pt')
     except:
         print('didnt load model as sparsity = 1')
     # New Code #

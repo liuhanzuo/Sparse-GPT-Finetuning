@@ -57,7 +57,7 @@ loaded_model = OPTForCausalLM.from_pretrained(f'facebook/{model_name}',
                                                   output_attentions=True,
                                                   output_hidden_states=True)
 if SPARSITY != 1:
-    load_masked_model_single(loaded_model, f'pruned_models/{model_name}-{SPARSITY}.pt')
+    loaded_model = load_masked_model_single(loaded_model, f'pruned_models/{model_name}-{SPARSITY}.pt')
 
 t_optim = torch.optim.AdamW(params=loaded_model.parameters(), lr=1e-5)
 loaded_model, t_optim, dataloader = accelerate.prepare(loaded_model, t_optim, dataloader)
