@@ -1,9 +1,11 @@
 import os
 import gc
+import json
 import argparse
 from tqdm import tqdm
 
 import torch
+
 from torch.utils.data import DataLoader
 from torch.nn.utils import prune
 
@@ -319,12 +321,16 @@ def iterative_training(config, args):
         )
 
         # 2) 训练 epochs_per_iteration 轮（每轮都重新 build opt/scheduler，且仅包含可训练参数）
-        accelerator.print(f"\n📚 Training for {epochs_per_iteration} epochs...")
+        # 动态训练：至少训练 epochs_per_iteration 个 epoch，如果 PPL 下降幅度 > 2 则继续训练
+        accelerator.print(f"\n📚 Training for at least {epochs_per_iteration} epochs (with dynamic extension)...")
+        
+        # 计算总的训练步数（预估最大值，用于 scheduler）
+        max_total_epochs = epochs_per_iteration + 20  # 预留额外的 epoch 空间
         optimizer = torch.optim.AdamW(get_trainable_params(model), lr=lr_sparse, weight_decay=2e-4)
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=2,
-            num_training_steps=(config["max_steps"] * epochs_per_iteration) // gradient_accumulation_steps,
+            num_training_steps=(config["max_steps"] * max_total_epochs) // gradient_accumulation_steps,
         )
         optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
@@ -333,10 +339,16 @@ def iterative_training(config, args):
         SNAP_BEFORE = snapshot_params(base)  # 变化监控（可选）
 
         iteration_losses = []
-
-        for epoch in range(epochs_per_iteration):
+        epoch_perplexities = []  # 记录每个 epoch 的 perplexity
+        ppl_improvement_threshold = config.get("ppl_improvement_threshold", 2.0)  # PPL 下降幅度阈值
+        
+        epoch = 0
+        continue_training = True
+        
+        while continue_training:
+            epoch += 1
             accelerator.print(f"\n{'='*70}")
-            accelerator.print(f"📊 Iteration {iteration}, Epoch {epoch + 1}/{epochs_per_iteration}")
+            accelerator.print(f"📊 Iteration {iteration}, Epoch {epoch} (min: {epochs_per_iteration})")
             accelerator.print(f"{'='*70}")
 
             with TorchTracemalloc() as tracemalloc:
@@ -346,7 +358,7 @@ def iterative_training(config, args):
                 progress_bar = tqdm(
                     enumerate(train_dataloader),
                     total=config['max_steps'],
-                    desc=f"Epoch {epoch + 1}",
+                    desc=f"Epoch {epoch}",
                     disable=not accelerator.is_local_main_process
                 )
 
@@ -388,10 +400,24 @@ def iterative_training(config, args):
 
             final_avg_loss = epoch_loss / max(1, num_batches)
             iteration_losses.append(final_avg_loss)
+            
+            # 每个 epoch 后评估 perplexity
+            accelerator.print(f"\n🔍 Evaluating after Epoch {epoch}...")
+            current_epoch_ppl = evaluate_and_log(
+                model=model,
+                model_name=config["model_name"],
+                epoch=None,
+                config={**config, 'sparsity': 1.0 - current_sparsity/100},
+                device=accelerator.device,
+                accelerator=accelerator
+            )
+            epoch_perplexities.append(current_epoch_ppl)
+            
             accelerator.print(f"\n{'='*70}")
-            accelerator.print(f"✅ Iteration {iteration}, Epoch {epoch + 1} Complete")
+            accelerator.print(f"✅ Iteration {iteration}, Epoch {epoch} Complete")
             accelerator.print(f"{'='*70}")
             accelerator.print(f"  📊 Average Loss: {final_avg_loss:.4f}")
+            accelerator.print(f"  📈 Perplexity: {current_epoch_ppl:.2f}")
             accelerator.print(f"  🔢 Total Steps: {num_batches}")
             accelerator.print(f"\n💾 Memory Stats:")
             accelerator.print(f"  Memory before entering the train: {b2mb(tracemalloc.begin)} MB")
@@ -400,35 +426,147 @@ def iterative_training(config, args):
             accelerator.print(
                 f"  Total Peak Memory (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)} MB"
             )
+            
+            # 判断是否继续训练
+            if epoch < epochs_per_iteration:
+                # 还没达到最小 epoch 数，继续训练
+                accelerator.print(f"  ⏩ Continue training (minimum epochs not reached: {epoch}/{epochs_per_iteration})")
+                continue_training = True
+            else:
+                # 已达到最小 epoch 数，检查 PPL 改善情况
+                if len(epoch_perplexities) >= 2:
+                    ppl_improvement = epoch_perplexities[-2] - epoch_perplexities[-1]
+                    accelerator.print(f"  📉 PPL Improvement: {ppl_improvement:.2f}")
+                    
+                    if ppl_improvement > ppl_improvement_threshold:
+                        accelerator.print(f"  ⏩ Continue training (PPL improvement {ppl_improvement:.2f} > {ppl_improvement_threshold})")
+                        continue_training = True
+                    else:
+                        accelerator.print(f"  ⏸️ Stop training (PPL improvement {ppl_improvement:.2f} <= {ppl_improvement_threshold})")
+                        continue_training = False
+                else:
+                    # 只有一个 epoch 的数据，停止
+                    continue_training = False
 
-        # 训练后变化监控（可选打印）
+
+        # 训练后变化监控 - 详细检查
         SNAP_AFTER = snapshot_params(base)
         changed_pruned, changed_nonpruned = diff_report(SNAP_BEFORE, SNAP_AFTER, PRUNED_NAMES, eps=1e-7)
-        print(f"✅ 发生变化的剪枝层参数数: {len(changed_pruned)}")
-        print(f"❗发生变化的非剪枝层参数数: {len(changed_nonpruned)}")
+        
+        accelerator.print(f"\n{'='*70}")
+        accelerator.print(f"🔍 PARAMETER CHANGE VERIFICATION - Iteration {iteration}")
+        accelerator.print(f"{'='*70}")
+        
+        # 统计被prune层的变化
+        accelerator.print(f"\n✅ Pruned Layers (Should Change):")
+        accelerator.print(f"  Total pruned parameters changed: {len(changed_pruned)}")
+        if changed_pruned:
+            accelerator.print(f"  Top 10 changes:")
+            for i, (n, d) in enumerate(changed_pruned[:10], 1):
+                accelerator.print(f"    {i}. {n}: maxΔ={d:.2e}")
+        else:
+            accelerator.print(f"  ⚠️ WARNING: No pruned parameters changed!")
+        
+        # 统计非prune层的变化
+        accelerator.print(f"\n❌ Non-Pruned Layers (Should NOT Change):")
+        accelerator.print(f"  Total non-pruned parameters changed: {len(changed_nonpruned)}")
         if changed_nonpruned:
-            print("非剪枝层被改动（Top 20）：")
-            for n, d in changed_nonpruned[:20]:
-                print(f"  - {n} | maxΔ={d:.2e}")
+            accelerator.print(f"  ⚠️ WARNING: Non-pruned layers were modified!")
+            accelerator.print(f"  Top 20 unexpected changes:")
+            for i, (n, d) in enumerate(changed_nonpruned[:20], 1):
+                if isinstance(d, str):
+                    accelerator.print(f"    {i}. {n}: {d}")
+                else:
+                    accelerator.print(f"    {i}. {n}: maxΔ={d:.2e}")
+        else:
+            accelerator.print(f"  ✅ GOOD: All non-pruned layers remain frozen!")
+        
+        # 详细统计各类参数
+        accelerator.print(f"\n📊 Detailed Parameter Statistics:")
+        total_params = len(SNAP_BEFORE)
+        total_changed = len(changed_pruned) + len(changed_nonpruned)
+        total_unchanged = total_params - total_changed
+        
+        accelerator.print(f"  Total parameters: {total_params}")
+        accelerator.print(f"  Changed (pruned): {len(changed_pruned)}")
+        accelerator.print(f"  Changed (non-pruned): {len(changed_nonpruned)}")
+        accelerator.print(f"  Unchanged: {total_unchanged}")
+        
+        # 验证requires_grad设置
+        accelerator.print(f"\n🔒 Gradient Settings Verification:")
+        trainable_count = 0
+        frozen_count = 0
+        trainable_names = []
+        
+        for name, param in base.named_parameters():
+            if param.requires_grad:
+                trainable_count += 1
+                trainable_names.append(name)
+            else:
+                frozen_count += 1
+        
+        accelerator.print(f"  Trainable parameters: {trainable_count}")
+        accelerator.print(f"  Frozen parameters: {frozen_count}")
+        
+        if trainable_names:
+            accelerator.print(f"  Trainable parameter list (first 20):")
+            for i, name in enumerate(trainable_names[:20], 1):
+                is_changed = any(name in changed_name for changed_name, _ in changed_pruned)
+                status = "✅ Changed" if is_changed else "⚠️ No change"
+                accelerator.print(f"    {i}. {name} - {status}")
+        
+        # 最终验证结果
+        accelerator.print(f"\n{'='*70}")
+        if len(changed_nonpruned) == 0 and len(changed_pruned) > 0:
+            accelerator.print(f"✅ VERIFICATION PASSED: Training only affected pruned layers!")
+        elif len(changed_nonpruned) > 0:
+            accelerator.print(f"❌ VERIFICATION FAILED: {len(changed_nonpruned)} non-pruned layers were modified!")
+        else:
+            accelerator.print(f"⚠️ WARNING: No parameters changed during training!")
+        accelerator.print(f"{'='*70}\n")
 
-        # 3) 本次迭代后评估
-        accelerator.print(f"\n🔍 Evaluating after Iteration {iteration} training...")
-        post_train_ppl = evaluate_and_log(
-            model=model,
-            model_name=config["model_name"],
-            epoch=iteration - 1,
-            config={**config, 'sparsity': 1.0 - current_sparsity/100},
-            device=accelerator.device,
-            accelerator=accelerator
-        )
 
+        # 3) 本次迭代后的最终 perplexity（使用最后一个 epoch 的结果）
+        post_train_ppl = epoch_perplexities[-1] if epoch_perplexities else post_prune_ppl
+        accelerator.print(f"\n🔍 Final Perplexity after Iteration {iteration}: {post_train_ppl:.2f}")
+
+
+        # 保存验证信息
+        verification_info = {
+            'pruned_params_changed': len(changed_pruned),
+            'non_pruned_params_changed': len(changed_nonpruned),
+            'total_params': len(SNAP_BEFORE),
+            'verification_passed': len(changed_nonpruned) == 0 and len(changed_pruned) > 0,
+            'trainable_params_count': trainable_count,
+            'frozen_params_count': frozen_count,
+        }
+        
+        # 添加变化最大的参数信息
+        if changed_pruned:
+            verification_info['top_pruned_changes'] = [
+                {'name': n, 'max_delta': float(d) if not isinstance(d, str) else d} 
+                for n, d in changed_pruned[:10]
+            ]
+        
+        if changed_nonpruned:
+            verification_info['top_non_pruned_changes'] = [
+                {'name': n, 'max_delta': float(d) if not isinstance(d, str) else d} 
+                for n, d in changed_nonpruned[:10]
+            ]
+        
         perplexity_history['iterations'].append({
             'iteration': iteration,
             'sparsity': current_sparsity,
             'post_prune_ppl': post_prune_ppl,
             'post_train_ppl': post_train_ppl,
-            'avg_loss': sum(iteration_losses) / max(1, len(iteration_losses))
+            'avg_loss': sum(iteration_losses) / max(1, len(iteration_losses)),
+            'total_epochs': epoch,
+            'epoch_losses': iteration_losses,
+            'epoch_perplexities': epoch_perplexities,
+            'verification': verification_info
         })
+
+
 
         accelerator.print(f"\n📊 Iteration {iteration} Summary:")
         accelerator.print(f"  ✂️ Sparsity: {current_sparsity:.2f}%")
@@ -436,10 +574,37 @@ def iterative_training(config, args):
         accelerator.print(f"  📈 After Training: {post_train_ppl:.2f}")
         recovery = ((post_prune_ppl - post_train_ppl) / max(1e-8, post_prune_ppl)) * 100
         accelerator.print(f"  🎯 Recovery: {recovery:.1f}%")
+        
+        # 每个 iteration 后保存一次历史记录（增量保存）
+        if accelerator.is_main_process:
+            os.makedirs('training_logs', exist_ok=True)
+            history_file = f'training_logs/{config["model_name"]}-iterative-history.json'
+            
+            temp_history = {
+                'unpruned_baseline': perplexity_history['unpruned_baseline'],
+                'iterations': perplexity_history['iterations'],
+                'config': {
+                    'model_name': config['model_name'],
+                    'target_sparsity': target_sparsity,
+                    'prune_percentage': prune_percentage,
+                    'epochs_per_iteration': epochs_per_iteration,
+                    'ppl_improvement_threshold': config.get("ppl_improvement_threshold", 2.0),
+                    'learning_rate': lr_sparse,
+                    'batch_size': batch_size,
+                    'max_steps': config['max_steps'],
+                    'seed': seed,
+                }
+            }
+            
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump(temp_history, f, indent=2, ensure_ascii=False)
+            
+            accelerator.print(f"  💾 Progress saved to {history_file}")
 
         if current_sparsity >= target_sparsity * 100:
             accelerator.print(f"\n🎉 Target sparsity {target_sparsity*100:.1f}% reached!")
             break
+
 
     # 终汇总
     accelerator.print("\n" + "="*70)
@@ -454,7 +619,7 @@ def iterative_training(config, args):
         for it in perplexity_history['iterations']:
             accelerator.print(
                 f"  Iteration {it['iteration']}: Sparsity={it['sparsity']:.1f}%, "
-                f"PPL={it['post_train_ppl']:.2f}"
+                f"PPL={it['post_train_ppl']:.2f}, Epochs={it['total_epochs']}"
             )
         final_ppl = perplexity_history['iterations'][-1]['post_train_ppl']
         baseline_ppl = perplexity_history['unpruned_baseline']
@@ -464,6 +629,30 @@ def iterative_training(config, args):
         accelerator.print(f"  vs Unpruned: {degradation:+.1f}%")
 
     accelerator.print("="*70)
+    
+    # 保存训练历史到 JSON 文件
+    if accelerator.is_main_process:
+        os.makedirs('training_logs', exist_ok=True)
+        history_file = f'training_logs/{config["model_name"]}-iterative-history.json'
+        
+        # 添加配置信息到历史记录
+        perplexity_history['config'] = {
+            'model_name': config['model_name'],
+            'target_sparsity': target_sparsity,
+            'prune_percentage': prune_percentage,
+            'epochs_per_iteration': epochs_per_iteration,
+            'ppl_improvement_threshold': config.get("ppl_improvement_threshold", 2.0),
+            'learning_rate': lr_sparse,
+            'batch_size': batch_size,
+            'max_steps': config['max_steps'],
+            'seed': seed,
+        }
+        
+        with open(history_file, 'w', encoding='utf-8') as f:
+            json.dump(perplexity_history, f, indent=2, ensure_ascii=False)
+        
+        accelerator.print(f"\n💾 Training history saved to {history_file}")
+
 
     # 保存
     if not config.get('save_model') or config['save_model']:

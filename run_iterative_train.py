@@ -43,6 +43,9 @@ def main():
                        help="Maximum training steps per epoch")
     parser.add_argument("--num-epochs", type=int, default=3,
                        help="Number of epochs to train after each pruning")
+    parser.add_argument("--ppl-improvement-threshold", type=float, default=2.0,
+                       help="PPL improvement threshold for continuing training")
+
     
     # System configuration  
     parser.add_argument("--seed", type=int, default=42,
@@ -65,7 +68,9 @@ def main():
         "max_steps": args.max_steps,
         "seed": args.seed,
         "save_model": args.save_model,
+        "ppl_improvement_threshold": args.ppl_improvement_threshold,
     }
+
     
     print("="*70)
     print("🔄 ITERATIVE PRUNING CONFIGURATION")
@@ -73,12 +78,14 @@ def main():
     print(f"  Model: {config['model_name']}")
     print(f"  Target Sparsity: {config['target_sparsity']*100:.1f}%")
     print(f"  Prune per iteration: {config['prune_percentage']*100:.1f}% of non-zeros")
-    print(f"  Epochs per iteration: {config['epochs_per_iteration']}")
+    print(f"  Epochs per iteration (minimum): {config['epochs_per_iteration']}")
+    print(f"  PPL improvement threshold: {config['ppl_improvement_threshold']}")
     print(f"  Max iterations: {config['max_iterations']}")
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Learning rate: {config['lr']}")
     print(f"  Max steps per epoch: {config['max_steps']}")
     print("="*70)
+
     
     # Run training
     iterative_training_wrapper(config)
